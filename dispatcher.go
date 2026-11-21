@@ -253,6 +253,35 @@ func (pcond *ReqProxyConds) Do(h ReqHandler) {
 		}))
 }
 
+// OnRequestForce registers a mandatory ReqHandler that is invoked for every
+// request, after the regular OnRequest handlers. Unlike handlers registered
+// with OnRequest, mandatory handlers keep running even when an earlier handler
+// short-circuits the chain by returning its own response. This guarantees
+// that mandatory policies (auditing, access control) are always enforced,
+// while keeping short-circuiting and low latency for regular handlers.
+//
+// If a mandatory handler returns a non-nil response, it replaces any response
+// produced by an earlier handler; otherwise the in-flight request or response
+// is passed through unchanged.
+func (proxy *ProxyHttpServer) OnRequestForce() *ForceReqProxyConds {
+	return &ForceReqProxyConds{proxy}
+}
+
+// ForceReqProxyConds registers mandatory ReqHandlers via Do and DoFunc.
+type ForceReqProxyConds struct {
+	proxy *ProxyHttpServer
+}
+
+// DoFunc is equivalent to OnRequestForce().Do(FuncReqHandler(f)).
+func (pcond *ForceReqProxyConds) DoFunc(f func(req *http.Request, ctx *ProxyCtx) (*http.Request, *http.Response)) {
+	pcond.Do(FuncReqHandler(f))
+}
+
+// Do registers a mandatory ReqHandler; see OnRequestForce for semantics.
+func (pcond *ForceReqProxyConds) Do(h ReqHandler) {
+	pcond.proxy.forceReqHandlers = append(pcond.proxy.forceReqHandlers, h)
+}
+
 // HandleConnect is used when proxy receives an HTTP CONNECT request,
 // it'll then use the HttpsHandler to determine what should it
 // do with this request. The handler returns a ConnectAction struct, the Action field in the ConnectAction

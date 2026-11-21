@@ -609,9 +609,10 @@ func (proxy *ProxyHttpServer) handleHttps(w http.ResponseWriter, r *http.Request
 							}
 							return false
 						}
-						if !proxy.KeepHeader {
-							RemoveProxyHeaders(ctx, req)
-						}
+						// Decrypted inner requests are bound for the origin
+						// server: proxy credentials must never reach it, even
+						// when KeepHeader is enabled for upstream chaining.
+						RemoveProxyHeaders(ctx, req, false)
 						resp, err = ctx.RoundTrip(req)
 						if err != nil {
 							ctx.Warnf("Cannot read response from mitm'd server %v", err)

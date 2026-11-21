@@ -158,6 +158,35 @@ interface in your type.
 > If the returned response is not nil, goproxy will discard the request
 > and send the specified response to the client.
 
+### Mandatory request handlers
+Regular `OnRequest` handlers form a short-circuiting chain: as soon as one
+returns a non-nil response, the remaining regular handlers are skipped and
+that response is returned to the client. This keeps the common path cheap,
+but it means handlers registered behind a short-circuit (for example audit
+logging or a final access-control check) never run.
+
+Use `OnRequestForce` for policies that must run on every request, including
+when an earlier handler already produced its own response:
+
+```go
+proxy.OnRequestForce().DoFunc(
+    func(req *http.Request, ctx *goproxy.ProxyCtx) (*http.Request, *http.Response) {
+        audit.Log(req, ctx.Resp) // ctx.Resp holds any canned response
+        return req, nil         // nil response passes the in-flight response through
+    })
+```
+
+Mandatory handlers run after the regular chain. Returning a non-nil response
+overrides the in-flight response (e.g. replacing it with a block page);
+returning a nil response leaves it unchanged.
+
+### Proxy credentials
+`Proxy-Authorization` is a hop-by-hop header and is stripped before every
+request reaches an origin server, on the plain HTTP, decrypted MITM and
+HTTP/2 paths. Setting `KeepHeader = true` only preserves it when the next hop
+is an upstream proxy configured on `proxy.Tr.Proxy`, so credentials given to
+this proxy are never forwarded beyond that proxy hop.
+
 ### Conditional Request handler
 Refuse connections to www.reddit.com between 8 and 17 in the server
 local timezone:

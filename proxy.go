@@ -30,6 +30,10 @@ type ProxyHttpServer struct {
 	reqHandlers     []ReqHandler
 	respHandlers    []RespHandler
 	httpsHandlers   []HttpsHandler
+	// forceReqHandlers always run, even when an earlier regular ReqHandler
+	// short-circuits the chain by returning a canned response. Use them for
+	// mandatory policies such as auditing and access control.
+	forceReqHandlers []ReqHandler
 	// Tr is the http.Transport used to send requests to destination servers.
 	// Defaults to a transport that skips TLS verification and reads proxy settings from environment variables.
 	Tr *http.Transport
@@ -50,8 +54,11 @@ type ProxyHttpServer struct {
 	// previously generated TLS certificates for the same hostname, avoiding repeated
 	// CPU-intensive signing operations. Strongly recommended for production use.
 	CertStore CertStorage
-	// KeepHeader, when true, preserves the Proxy-Authorization header when forwarding
-	// requests to an upstream proxy. By default this header is stripped.
+	// KeepHeader, when true, preserves the Proxy-Authorization header when
+	// forwarding requests to an upstream proxy, allowing proxy chaining. The
+	// header is still stripped before any request reaches an origin server
+	// (including decrypted MITM and HTTP/2 requests), so client credentials
+	// given to this proxy never propagate beyond the next proxy hop.
 	KeepHeader bool
 	// AllowHTTP2, when true, enables HTTP/2 support in the proxy. Disabled by default.
 	AllowHTTP2 bool
@@ -101,6 +108,26 @@ func (proxy *ProxyHttpServer) filterRequest(r *http.Request, ctx *ProxyCtx) (req
 			break
 		}
 	}
+	// Mandatory handlers always run, even when the regular chain already
+	// produced a canned response. They may still replace the in-flight
+	// request or override the response (e.g. with a block page).
+	if req == nil {
+		req = r
+	}
+	ctx.Resp = resp
+	for _, h := range proxy.forceReqHandlers {
+		nextReq, nextResp := h.Handle(req, ctx)
+		if nextReq != nil {
+			req = nextReq
+		}
+		// A mandatory audit handler returns a nil response to pass the
+		// in-flight (possibly canned) response through unchanged.
+		if nextResp != nil {
+			resp = nextResp
+		}
+		ctx.Req = req
+		ctx.Resp = resp
+	}
 	return
 }
 
@@ -113,8 +140,27 @@ func (proxy *ProxyHttpServer) filterResponse(respOrig *http.Response, ctx *Proxy
 	return
 }
 
-// RemoveProxyHeaders removes all proxy headers which should not propagate to the next hop.
-func RemoveProxyHeaders(ctx *ProxyCtx, r *http.Request) {
+// forwardingToUpstreamProxy reports whether the next hop for req is an
+// upstream proxy (rather than the origin server), based on the configured
+// transport. Proxy credentials may only be retained when this is true, so
+// they never leak to an origin on a direct connection.
+func (proxy *ProxyHttpServer) forwardingToUpstreamProxy(req *http.Request) bool {
+	if proxy.Tr == nil || proxy.Tr.Proxy == nil {
+		return false
+	}
+	proxyURL, err := proxy.Tr.Proxy(req)
+	return err == nil && proxyURL != nil
+}
+
+// RemoveProxyHeaders removes proxy headers which should not propagate to the
+// next hop. It must always run, even when KeepHeader is enabled, because it
+// also resets RequestURI so the request can be reused by an http.RoundTripper.
+//
+// keepProxyAuth controls Proxy-Authorization: pass true when the next hop is
+// an upstream proxy that needs the client's credentials (proxy chaining).
+// Pass false when talking to an origin server, so proxy credentials never
+// leak to destinations (plain HTTP, MITM decrypted and HTTP/2 paths).
+func RemoveProxyHeaders(ctx *ProxyCtx, r *http.Request, keepProxyAuth bool) {
 	r.RequestURI = "" // this must be reset when serving a request with the client
 	ctx.Logf("Sending request %v %v", r.Method, r.URL.String())
 	if !ctx.Proxy.KeepAcceptEncoding {
@@ -126,7 +172,9 @@ func RemoveProxyHeaders(ctx *ProxyCtx, r *http.Request) {
 	// https://jdebp.eu./FGA/web-proxy-connection-header.html
 	r.Header.Del("Proxy-Connection")
 	r.Header.Del("Proxy-Authenticate")
-	r.Header.Del("Proxy-Authorization")
+	if !keepProxyAuth {
+		r.Header.Del("Proxy-Authorization")
+	}
 	// Connection, Authenticate and Authorization are single hop Header:
 	// http://www.w3.org/Protocols/rfc2616/rfc2616.txt
 	// 14.10 Connection

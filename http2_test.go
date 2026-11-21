@@ -167,6 +167,48 @@ func TestMitmHTTP2ALPNRequestFilter(t *testing.T) {
 	assert.Equal(t, "blocked-by-proxy", string(body))
 }
 
+func TestMitmHTTP2StripsProxyAuthorization(t *testing.T) {
+	var gotProxyAuth string
+	backend := httptest.NewUnstartedServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotProxyAuth = r.Header.Get("Proxy-Authorization")
+		_, _ = io.WriteString(w, "hello-h2")
+	}))
+	backend.EnableHTTP2 = true
+	backend.StartTLS()
+	defer backend.Close()
+
+	proxy := goproxy.NewProxyHttpServer()
+	proxy.AllowHTTP2 = true
+	// KeepHeader is enabled for upstream chaining, but must not leak
+	// credentials to the origin on the decrypted HTTP/2 path.
+	proxy.KeepHeader = true
+	proxy.Tr = &http.Transport{
+		ForceAttemptHTTP2: true,
+		TLSClientConfig: &tls.Config{
+			InsecureSkipVerify: true,
+			NextProtos:         []string{"h2"},
+		},
+	}
+	proxy.OnRequest().HandleConnect(goproxy.AlwaysMitm)
+
+	proxySrv := httptest.NewServer(proxy)
+	defer proxySrv.Close()
+
+	client := createProxyClientH2(t, proxySrv.URL)
+	req, err := http.NewRequestWithContext(context.Background(), http.MethodGet, backend.URL+"/test", nil)
+	require.NoError(t, err)
+	req.Header.Set("Proxy-Authorization", "Basic Zm9vOmJhcg==")
+
+	resp, err := client.Do(req)
+	require.NoError(t, err)
+	defer resp.Body.Close()
+
+	body, err := io.ReadAll(resp.Body)
+	require.NoError(t, err)
+	assert.Equal(t, "hello-h2", string(body))
+	assert.Empty(t, gotProxyAuth, "origin must never receive Proxy-Authorization over HTTP/2 MITM")
+}
+
 func TestMitmHTTP2ALPNConcurrentStreams(t *testing.T) {
 	backend := httptest.NewUnstartedServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		_, _ = io.WriteString(w, html.EscapeString(r.URL.Path))

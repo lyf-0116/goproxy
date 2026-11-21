@@ -22,6 +22,7 @@ import (
 	"regexp"
 	"strconv"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -441,6 +442,53 @@ func TestFirstHandlerMatches(t *testing.T) {
 	}
 }
 
+func TestForcedHandlerRunsAfterShortCircuit(t *testing.T) {
+	proxy := goproxy.NewProxyHttpServer()
+
+	var regularSecondRan, forcedRan, forcedAuditSawResponse atomic.Bool
+	proxy.OnRequest().DoFunc(func(req *http.Request, ctx *goproxy.ProxyCtx) (*http.Request, *http.Response) {
+		return nil, goproxy.TextResponse(req, "koko")
+	})
+	// A regular handler behind a short-circuit must not run.
+	proxy.OnRequest().DoFunc(func(req *http.Request, ctx *goproxy.ProxyCtx) (*http.Request, *http.Response) {
+		regularSecondRan.Store(true)
+		return req, nil
+	})
+	// A mandatory handler still runs and observes the canned response.
+	proxy.OnRequestForce().DoFunc(func(req *http.Request, ctx *goproxy.ProxyCtx) (*http.Request, *http.Response) {
+		forcedRan.Store(true)
+		forcedAuditSawResponse.Store(ctx.Resp != nil)
+		return req, nil
+	})
+
+	client, l := oneShotProxy(proxy)
+	defer l.Close()
+
+	if resp := string(getOrFail(t, srv.URL+"/", client)); resp != "koko" {
+		t.Error("should return the canned response, got", resp)
+	}
+	assert.False(t, regularSecondRan.Load(), "regular handler after a short-circuit must not run")
+	assert.True(t, forcedRan.Load(), "forced handler must run even after a short-circuit")
+	assert.True(t, forcedAuditSawResponse.Load(), "forced handler must observe the canned response via ctx.Resp")
+}
+
+func TestForcedHandlerCanBlock(t *testing.T) {
+	proxy := goproxy.NewProxyHttpServer()
+	proxy.OnRequest().DoFunc(func(req *http.Request, ctx *goproxy.ProxyCtx) (*http.Request, *http.Response) {
+		return nil, goproxy.TextResponse(req, "allow")
+	})
+	proxy.OnRequestForce().DoFunc(func(req *http.Request, ctx *goproxy.ProxyCtx) (*http.Request, *http.Response) {
+		return nil, goproxy.TextResponse(req, "blocked")
+	})
+
+	client, l := oneShotProxy(proxy)
+	defer l.Close()
+
+	if resp := string(getOrFail(t, srv.URL+"/", client)); resp != "blocked" {
+		t.Error("forced handler response should win, got", resp)
+	}
+}
+
 func TestIcyResponse(t *testing.T) {
 	// TODO: fix this test
 	/*s := constantHttpServer([]byte("ICY 200 OK\r\n\r\nblablabla"))
@@ -468,9 +516,10 @@ type VerifyNoProxyHeaders struct {
 }
 
 func (v VerifyNoProxyHeaders) ServeHTTP(w http.ResponseWriter, r *http.Request) {
-	if r.Header.Get("Connection") != "" || r.Header.Get("Proxy-Connection") != "" ||
-		r.Header.Get("Proxy-Authenticate") != "" || r.Header.Get("Proxy-Authorization") != "" {
-		v.Error("Got Connection header from goproxy", r.Header)
+	for _, hopByHop := range []string{"Connection", "Proxy-Connection", "Proxy-Authenticate", "Proxy-Authorization"} {
+		if value := r.Header.Get(hopByHop); value != "" {
+			v.Errorf("origin received hop-by-hop header %s=%q from goproxy: %v", hopByHop, value, r.Header)
+		}
 	}
 }
 
@@ -486,16 +535,91 @@ func TestNoProxyHeaders(t *testing.T) {
 	_, _ = client.Do(req)
 }
 
+func TestNoProxyHeadersWithKeepHeader(t *testing.T) {
+	// KeepHeader must not leak Proxy-Authorization to the origin server on the
+	// plain-text path: it is only meant to survive until an upstream proxy.
+	s := httptest.NewServer(VerifyNoProxyHeaders{t})
+	proxy := goproxy.NewProxyHttpServer()
+	proxy.KeepHeader = true
+	client, l := oneShotProxy(proxy)
+	defer l.Close()
+	req, err := http.NewRequestWithContext(context.Background(), http.MethodGet, s.URL, nil)
+	panicOnErr(err, "bad request")
+	req.Header.Add("Proxy-Connection", "close")
+	req.Header.Add("Proxy-Authorization", "auth")
+	_, _ = client.Do(req)
+}
+
 func TestNoProxyHeadersHttps(t *testing.T) {
 	s := httptest.NewTLSServer(VerifyNoProxyHeaders{t})
 	proxy := goproxy.NewProxyHttpServer()
+	proxy.KeepHeader = true
 	proxy.OnRequest().HandleConnect(goproxy.AlwaysMitm)
 	client, l := oneShotProxy(proxy)
 	defer l.Close()
 	req, err := http.NewRequestWithContext(context.Background(), http.MethodGet, s.URL, nil)
 	panicOnErr(err, "bad request")
 	req.Header.Add("Proxy-Connection", "close")
+	req.Header.Add("Proxy-Authorization", "auth")
 	_, _ = client.Do(req)
+}
+
+func TestKeepHeaderPreservesCredentialsForUpstreamProxy(t *testing.T) {
+	originAuth := make(chan string, 1)
+	origin := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		originAuth <- r.Header.Get("Proxy-Authorization")
+		_, _ = io.WriteString(w, "origin-ok")
+	}))
+	defer origin.Close()
+
+	var gotProxyAuth string
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotProxyAuth = r.Header.Get("Proxy-Authorization")
+		r.RequestURI = ""
+		// A real proxy consumes hop-by-hop proxy credentials before
+		// forwarding the request to the origin server.
+		r.Header.Del("Proxy-Authorization")
+		r.Header.Del("Proxy-Connection")
+		forwardURL, err := url.Parse(origin.URL + r.URL.Path)
+		panicOnErr(err, "parse origin url")
+		r.URL = forwardURL
+		resp, err := http.DefaultTransport.RoundTrip(r)
+		if err != nil {
+			http.Error(w, err.Error(), http.StatusBadGateway)
+			return
+		}
+		defer resp.Body.Close()
+		for k, vs := range resp.Header {
+			for _, v := range vs {
+				w.Header().Add(k, v)
+			}
+		}
+		w.WriteHeader(resp.StatusCode)
+		_, _ = io.Copy(w, resp.Body)
+	}))
+	defer upstream.Close()
+
+	proxy := goproxy.NewProxyHttpServer()
+	proxy.KeepHeader = true
+	proxy.Tr.Proxy = func(req *http.Request) (*url.URL, error) {
+		return url.Parse(upstream.URL)
+	}
+	client, l := oneShotProxy(proxy)
+	defer l.Close()
+
+	req, err := http.NewRequestWithContext(context.Background(), http.MethodGet, origin.URL+"/", nil)
+	panicOnErr(err, "bad request")
+	req.Header.Set("Proxy-Authorization", "Basic Zm9vOmJhcg==")
+	resp, err := client.Do(req)
+	panicOnErr(err, "client.Do through upstream proxy")
+	defer resp.Body.Close()
+	body, err := io.ReadAll(resp.Body)
+	panicOnErr(err, "read upstream response")
+	assert.Equal(t, "origin-ok", string(body))
+	assert.Equal(t, "Basic Zm9vOmJhcg==", gotProxyAuth,
+		"KeepHeader must preserve Proxy-Authorization on the upstream proxy hop")
+	assert.Empty(t, <-originAuth,
+		"the upstream proxy must not forward Proxy-Authorization to the origin server")
 }
 
 type VerifyAcceptEncodingHeader struct {

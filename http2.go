@@ -156,9 +156,9 @@ func (proxy *ProxyHttpServer) handleH2MitmStream(
 	req, resp := proxy.filterRequest(r, ctx)
 	if resp == nil {
 		removeH2HopByHopHeaders(req)
-		if !proxy.KeepHeader {
-			RemoveProxyHeaders(ctx, req)
-		}
+		// HTTP/2 MITM streams terminate at the origin server, so proxy
+		// credentials are always stripped regardless of KeepHeader.
+		RemoveProxyHeaders(ctx, req, false)
 
 		// bodyless h2 requests arrive with a non-nil empty Body; forwarding as-is
 		// makes the upstream transport send a phantom body (-1). keep it bodyless.

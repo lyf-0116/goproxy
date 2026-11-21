@@ -18,9 +18,11 @@ func (proxy *ProxyHttpServer) handleHttp(w http.ResponseWriter, r *http.Request)
 	r, resp := proxy.filterRequest(r, ctx)
 
 	if resp == nil {
-		if !proxy.KeepHeader {
-			RemoveProxyHeaders(ctx, r)
-		}
+		// Proxy credentials survive only when KeepHeader is enabled and the
+		// next hop really is an upstream proxy. On a direct origin connection
+		// they are stripped like every other hop-by-hop header.
+		keepProxyAuth := proxy.KeepHeader && proxy.forwardingToUpstreamProxy(r)
+		RemoveProxyHeaders(ctx, r, keepProxyAuth)
 
 		var err error
 		resp, err = ctx.RoundTrip(r)
