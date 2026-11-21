@@ -153,6 +153,17 @@ func (proxy *ProxyHttpServer) handleH2MitmStream(
 		certStore:    parentCtx.certStore,
 	}
 
+	// A single CONNECT authorizes a single target, but HTTP/2 coalescing lets
+	// each stream carry its own :authority. Re-run the CONNECT authorization
+	// chain for any stream whose target differs from the authorized one, so
+	// every destination is checked against the interception rules and logged.
+	if !h2SameAuthority(host, r.URL.Host, scheme) &&
+		!proxy.authorizeH2StreamTarget(ctx, r.URL.Host) {
+		ctx.Warnf("HTTP/2 MITM: rejecting coalesced request to unauthorized host %s (CONNECT authorized %s)", r.URL.Host, host)
+		http.Error(w, "Forbidden: host not authorized by CONNECT", http.StatusForbidden)
+		return
+	}
+
 	req, resp := proxy.filterRequest(r, ctx)
 	if resp == nil {
 		removeH2HopByHopHeaders(req)
@@ -250,6 +261,53 @@ func (proxy *ProxyHttpServer) handleH2MitmStream(
 				}
 			}
 		}
+	}
+}
+
+// h2SameAuthority reports whether a coalesced stream target (reqHost) matches
+// the host authorized by the CONNECT request (connectHost). Hostnames compare
+// case-insensitively; a missing port defaults to the tunnel scheme's port.
+func h2SameAuthority(connectHost, reqHost, scheme string) bool {
+	normalize := func(h string) string {
+		name := strings.ToLower(stripPort(h))
+		port := ""
+		if _, p, err := net.SplitHostPort(h); err == nil {
+			port = p
+		}
+		if port == "" {
+			if scheme == "https" {
+				port = "443"
+			} else {
+				port = "80"
+			}
+		}
+		return name + ":" + port
+	}
+	return normalize(connectHost) == normalize(reqHost)
+}
+
+// authorizeH2StreamTarget re-runs the CONNECT handlers (proxy.httpsHandlers)
+// for a coalesced stream target, mirroring the authorization loop in
+// handleHttps. It returns true when the target may be proxied (Accept/MITM),
+// and false when the chain rejects it. Actions that require hijacking the
+// connection cannot be honored per-stream and are treated as rejections.
+func (proxy *ProxyHttpServer) authorizeH2StreamTarget(ctx *ProxyCtx, host string) bool {
+	ctx.Logf("HTTP/2 MITM: authorizing coalesced host %s", host)
+	todo := OkConnect
+	for i, h := range proxy.httpsHandlers {
+		newtodo, _ := h.HandleConnect(host, ctx)
+		// If found a result, break the loop immediately
+		if newtodo != nil {
+			todo = newtodo
+			ctx.Logf("on %dth handler: %v %s", i, todo, host)
+			break
+		}
+	}
+	switch todo.Action {
+	case ConnectAccept, ConnectHTTPMitm, ConnectMitm:
+		return true
+	default:
+		return false
 	}
 }
 

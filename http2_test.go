@@ -13,6 +13,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"net/url"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -401,8 +402,14 @@ func TestMitmH2C(t *testing.T) {
 	defer conn.Close()
 
 	// Manually establish a single CONNECT tunnel
-	connectReq, err := http.NewRequestWithContext(context.Background(), http.MethodConnect, "a.com:443", nil)
-	require.NoError(t, err)
+	// url.URL{Opaque: ...} keeps "a.com:443" as the CONNECT authority;
+	// NewRequest("a.com:443") would parse "a.com" as the URL scheme.
+	connectReq := &http.Request{
+		Method: http.MethodConnect,
+		URL:    &url.URL{Opaque: "a.com:443"},
+		Host:   "a.com:443",
+		Header: make(http.Header),
+	}
 	require.NoError(t, connectReq.Write(conn))
 
 	connBuf := bufio.NewReader(conn)
@@ -480,8 +487,14 @@ func TestMitmHTTP2Coalescing(t *testing.T) {
 	defer conn.Close()
 
 	// Manually establish a single CONNECT tunnel
-	connectReq, err := http.NewRequestWithContext(context.Background(), http.MethodConnect, "a.com:443", nil)
-	require.NoError(t, err)
+	// url.URL{Opaque: ...} keeps "a.com:443" as the CONNECT authority;
+	// NewRequest("a.com:443") would parse "a.com" as the URL scheme.
+	connectReq := &http.Request{
+		Method: http.MethodConnect,
+		URL:    &url.URL{Opaque: "a.com:443"},
+		Host:   "a.com:443",
+		Header: make(http.Header),
+	}
 	require.NoError(t, connectReq.Write(conn))
 
 	resp, err := http.ReadResponse(bufio.NewReader(conn), connectReq)
@@ -516,7 +529,102 @@ func TestMitmHTTP2Coalescing(t *testing.T) {
 	require.NoError(t, err)
 	assert.Equal(t, "b.com", string(body2))
 
-	assert.Equal(t, 1, int(connectCalls.Load()))
+	// One CONNECT for a.com, plus one re-authorization for the coalesced b.com.
+	assert.Equal(t, 2, int(connectCalls.Load()))
+}
+
+// TestMitmHTTP2CoalescingRejected verifies that a coalesced request whose host
+// is rejected by the CONNECT handlers gets a 403 on its own stream, while the
+// multiplexed connection stays usable for authorized hosts.
+func TestMitmHTTP2CoalescingRejected(t *testing.T) {
+	backend := httptest.NewUnstartedServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = io.WriteString(w, html.EscapeString(r.Host))
+	}))
+	backend.EnableHTTP2 = true
+	backend.StartTLS()
+	defer backend.Close()
+
+	proxy := goproxy.NewProxyHttpServer()
+	proxy.AllowHTTP2 = true
+	proxy.Tr = &http.Transport{
+		ForceAttemptHTTP2: true,
+		TLSClientConfig: &tls.Config{
+			InsecureSkipVerify: true,
+			NextProtos:         []string{"h2"},
+		},
+	}
+
+	backendAddr := backend.Listener.Addr().String()
+	proxy.Tr.DialContext = func(ctx context.Context, network, addr string) (net.Conn, error) {
+		return (&net.Dialer{}).DialContext(ctx, network, backendAddr)
+	}
+
+	proxy.OnRequest().HandleConnectFunc(func(host string, ctx *goproxy.ProxyCtx) (*goproxy.ConnectAction, string) {
+		if strings.HasPrefix(host, "b.com") {
+			return goproxy.RejectConnect, host
+		}
+		return goproxy.MitmConnect, host
+	})
+
+	proxySrv := httptest.NewServer(proxy)
+	defer proxySrv.Close()
+
+	proxyURL, err := url.Parse(proxySrv.URL)
+	require.NoError(t, err)
+
+	conn, err := (&net.Dialer{}).DialContext(context.Background(), "tcp", proxyURL.Host)
+	require.NoError(t, err)
+	defer conn.Close()
+
+	// url.URL{Opaque: ...} keeps "a.com:443" as the CONNECT authority;
+	// NewRequest("a.com:443") would parse "a.com" as the URL scheme.
+	connectReq := &http.Request{
+		Method: http.MethodConnect,
+		URL:    &url.URL{Opaque: "a.com:443"},
+		Host:   "a.com:443",
+		Header: make(http.Header),
+	}
+	require.NoError(t, connectReq.Write(conn))
+
+	resp, err := http.ReadResponse(bufio.NewReader(conn), connectReq)
+	require.NoError(t, err)
+	require.Equal(t, http.StatusOK, resp.StatusCode)
+
+	tlsConn := tls.Client(conn, &tls.Config{
+		InsecureSkipVerify: true,
+		NextProtos:         []string{"h2"},
+	})
+	require.NoError(t, tlsConn.HandshakeContext(context.Background()))
+	tr := &http2.Transport{}
+	h2conn, err := tr.NewClientConn(tlsConn)
+	require.NoError(t, err)
+
+	// Authorized host succeeds.
+	req1, err := http.NewRequestWithContext(context.Background(), http.MethodGet, "https://a.com/test", nil)
+	require.NoError(t, err)
+	resp1, err := h2conn.RoundTrip(req1)
+	require.NoError(t, err)
+	body1, err := io.ReadAll(resp1.Body)
+	require.NoError(t, err)
+	assert.Equal(t, "a.com", string(body1))
+
+	// Coalesced unauthorized host is rejected on its own stream.
+	req2, err := http.NewRequestWithContext(context.Background(), http.MethodGet, "https://b.com/test", nil)
+	require.NoError(t, err)
+	resp2, err := h2conn.RoundTrip(req2)
+	require.NoError(t, err)
+	_, _ = io.Copy(io.Discard, resp2.Body)
+	_ = resp2.Body.Close()
+	assert.Equal(t, http.StatusForbidden, resp2.StatusCode)
+
+	// The multiplexed connection is still usable for the authorized host.
+	req3, err := http.NewRequestWithContext(context.Background(), http.MethodGet, "https://a.com/again", nil)
+	require.NoError(t, err)
+	resp3, err := h2conn.RoundTrip(req3)
+	require.NoError(t, err)
+	body3, err := io.ReadAll(resp3.Body)
+	require.NoError(t, err)
+	assert.Equal(t, "a.com", string(body3))
 }
 
 func createProxyClientH2(t *testing.T, proxyURL string) *http.Client {
