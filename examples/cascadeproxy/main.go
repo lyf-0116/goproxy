@@ -35,22 +35,23 @@ func main() {
 	// Start middle proxy server
 	middleProxy := goproxy.NewProxyHttpServer()
 	middleProxy.Verbose = true
-	middleProxy.KeepHeader = true
+	// Credentials for the upstream proxy are embedded in the proxy URL.
+	// http.Transport adds Proxy-Authorization on the hop to the upstream
+	// proxy itself; the header is hop-by-hop and is never forwarded to the
+	// origin server. For an HTTPS upstream, pass the same URL to
+	// NewConnectDialToProxyWithHandler and set the header on the CONNECT
+	// request instead.
+	upstreamProxyURL := "http://" + username + ":" + password + "@localhost:8082"
 	middleProxy.Tr.Proxy = func(req *http.Request) (*url.URL, error) {
 		// Here we specify the proxy URL of the other server.
 		// If it was a socks5 proxy, we would have used an url like
 		// socks5://localhost:8082
-		return url.Parse("http://localhost:8082")
+		return url.Parse(upstreamProxyURL)
 	}
 	connectReqHandler := func(req *http.Request) {
 		SetBasicAuth(username, password, req)
 	}
-	middleProxy.ConnectDial = middleProxy.NewConnectDialToProxyWithHandler("http://localhost:8082", connectReqHandler)
-
-	middleProxy.OnRequest().Do(goproxy.FuncReqHandler(func(req *http.Request, ctx *goproxy.ProxyCtx) (*http.Request, *http.Response) {
-		SetBasicAuth(username, password, req)
-		return req, nil
-	}))
+	middleProxy.ConnectDial = middleProxy.NewConnectDialToProxyWithHandler(upstreamProxyURL, connectReqHandler)
 	log.Println("serving middle proxy server at localhost:8081")
 	go http.ListenAndServe("localhost:8081", middleProxy)
 

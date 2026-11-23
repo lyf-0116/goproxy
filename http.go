@@ -18,9 +18,7 @@ func (proxy *ProxyHttpServer) handleHttp(w http.ResponseWriter, r *http.Request)
 	r, resp := proxy.filterRequest(r, ctx)
 
 	if resp == nil {
-		if !proxy.KeepHeader {
-			RemoveProxyHeaders(ctx, r)
-		}
+		RemoveProxyHeaders(ctx, r)
 
 		var err error
 		resp, err = ctx.RoundTrip(r)

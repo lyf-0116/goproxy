@@ -609,9 +609,7 @@ func (proxy *ProxyHttpServer) handleHttps(w http.ResponseWriter, r *http.Request
 							}
 							return false
 						}
-						if !proxy.KeepHeader {
-							RemoveProxyHeaders(ctx, req)
-						}
+						RemoveProxyHeaders(ctx, req)
 						resp, err = ctx.RoundTrip(req)
 						if err != nil {
 							ctx.Warnf("Cannot read response from mitm'd server %v", err)
@@ -811,94 +809,88 @@ func (proxy *ProxyHttpServer) NewConnectDialToProxyWithHandler(
 	if err != nil {
 		return nil
 	}
-	if u.Scheme == "" || u.Scheme == "http" || u.Scheme == "ws" {
+
+	useTLS := false
+	switch u.Scheme {
+	case "", "http", "ws":
 		if !strings.ContainsRune(u.Host, ':') {
 			u.Host += ":80"
 		}
-		return func(network, addr string) (net.Conn, error) {
-			connectReq := &http.Request{
-				Method: http.MethodConnect,
-				URL:    &url.URL{Opaque: addr},
-				Host:   addr,
-				Header: make(http.Header),
-			}
-			if connectReqHandler != nil {
-				connectReqHandler(connectReq)
-			}
-			c, err := proxy.dial(&ProxyCtx{Req: &http.Request{}}, network, u.Host)
-			if err != nil {
-				return nil, err
-			}
-			_ = connectReq.Write(c)
-			// Read response.
-			// Okay to use and discard buffered reader here, because
-			// TLS server will not speak until spoken to.
-			br := bufio.NewReader(c)
-			resp, err := http.ReadResponse(br, connectReq)
-			if err != nil {
-				_ = c.Close()
-				return nil, err
-			}
-			defer resp.Body.Close()
-			if resp.StatusCode != http.StatusOK {
-				resp, err := io.ReadAll(io.LimitReader(resp.Body, _errorRespMaxLength))
-				if err != nil {
-					return nil, err
-				}
-				_ = c.Close()
-				return nil, errors.New("proxy refused connection" + string(resp))
-			}
-			return c, nil
-		}
-	}
-	if u.Scheme == "https" || u.Scheme == "wss" {
+	case "https", "wss":
+		useTLS = true
 		if !strings.ContainsRune(u.Host, ':') {
 			u.Host += ":443"
 		}
-		return func(network, addr string) (net.Conn, error) {
-			ctx := &ProxyCtx{Req: &http.Request{}}
-			c, err := proxy.dial(ctx, network, u.Host)
-			if err != nil {
-				return nil, err
-			}
-
-			c, err = proxy.initializeTLSconnection(ctx, c, proxy.Tr.TLSClientConfig, u.Host)
-			if err != nil {
-				return nil, err
-			}
-
-			connectReq := &http.Request{
-				Method: http.MethodConnect,
-				URL:    &url.URL{Opaque: addr},
-				Host:   addr,
-				Header: make(http.Header),
-			}
-			if connectReqHandler != nil {
-				connectReqHandler(connectReq)
-			}
-			_ = connectReq.Write(c)
-			// Read response.
-			// Okay to use and discard buffered reader here, because
-			// TLS server will not speak until spoken to.
-			br := bufio.NewReader(c)
-			resp, err := http.ReadResponse(br, connectReq)
-			if err != nil {
-				_ = c.Close()
-				return nil, err
-			}
-			defer resp.Body.Close()
-			if resp.StatusCode != http.StatusOK {
-				body, err := io.ReadAll(io.LimitReader(resp.Body, _errorRespMaxLength))
-				if err != nil {
-					return nil, err
-				}
-				_ = c.Close()
-				return nil, errors.New("proxy refused connection" + string(body))
-			}
-			return c, nil
-		}
+	default:
+		return nil
 	}
-	return nil
+
+	return func(network, addr string) (net.Conn, error) {
+		ctx := &ProxyCtx{Req: &http.Request{}}
+		c, err := proxy.dial(ctx, network, u.Host)
+		if err != nil {
+			return nil, err
+		}
+
+		if useTLS {
+			// Use a dedicated config for the upstream proxy: never reuse the
+			// origin-facing Tr.TLSClientConfig, which often disables
+			// verification for MITM and would leave proxy credentials
+			// exposed to an active attacker.
+			c, err = proxy.initializeTLSconnection(ctx, c, proxy.upstreamProxyTLSConfig(), u.Host)
+			if err != nil {
+				if c != nil {
+					_ = c.Close()
+				}
+				return nil, err
+			}
+		}
+
+		connectReq := &http.Request{
+			Method: http.MethodConnect,
+			URL:    &url.URL{Opaque: addr},
+			Host:   addr,
+			Header: make(http.Header),
+		}
+		if connectReqHandler != nil {
+			connectReqHandler(connectReq)
+		}
+		if err := connectReq.Write(c); err != nil {
+			_ = c.Close()
+			return nil, err
+		}
+		// Read response.
+		// Okay to use and discard buffered reader here, because
+		// TLS server will not speak until spoken to.
+		br := bufio.NewReader(c)
+		resp, err := http.ReadResponse(br, connectReq)
+		if err != nil {
+			_ = c.Close()
+			return nil, err
+		}
+		defer resp.Body.Close()
+		if resp.StatusCode != http.StatusOK {
+			body, readErr := io.ReadAll(io.LimitReader(resp.Body, _errorRespMaxLength))
+			if readErr != nil {
+				_ = c.Close()
+				return nil, readErr
+			}
+			_ = c.Close()
+			return nil, errors.New("proxy refused connection" + string(body))
+		}
+		return c, nil
+	}
+}
+
+// upstreamProxyTLSConfig returns the TLS configuration used for connections
+// to HTTPS upstream proxies. When the caller did not configure one, a secure
+// default (system root CAs, verification enabled) is returned, so upstream
+// proxy credentials are never sent over an unverified TLS connection.
+func (proxy *ProxyHttpServer) upstreamProxyTLSConfig() *tls.Config {
+	if proxy.UpstreamProxyTLSClientConfig != nil {
+		return proxy.UpstreamProxyTLSClientConfig
+	}
+	return &tls.Config{}
 }
 
 // TLSConfigFromCA returns a TLSConfig function that generates dynamic TLS certificates

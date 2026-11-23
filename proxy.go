@@ -1,6 +1,7 @@
 package goproxy
 
 import (
+	"crypto/tls"
 	"io"
 	"log"
 	"net"
@@ -50,9 +51,6 @@ type ProxyHttpServer struct {
 	// previously generated TLS certificates for the same hostname, avoiding repeated
 	// CPU-intensive signing operations. Strongly recommended for production use.
 	CertStore CertStorage
-	// KeepHeader, when true, preserves the Proxy-Authorization header when forwarding
-	// requests to an upstream proxy. By default this header is stripped.
-	KeepHeader bool
 	// AllowHTTP2, when true, enables HTTP/2 support in the proxy. Disabled by default.
 	AllowHTTP2 bool
 	// When PreventCanonicalization is true, the header names present in
@@ -72,6 +70,14 @@ type ProxyHttpServer struct {
 	// h2Server is the HTTP/2 server instance used for MITM.
 	// It is shared across all connections.
 	h2Server *http2.Server
+	// UpstreamProxyTLSClientConfig is the TLS configuration used when the
+	// proxy connects to an HTTPS upstream proxy (see NewConnectDialToProxy).
+	// It is intentionally separate from Tr.TLSClientConfig: the latter is also
+	// used for MITM handshakes with origin servers and is commonly set to
+	// InsecureSkipVerify, which would expose upstream proxy credentials to
+	// man-in-the-middle attackers. When nil, secure system-root verification is
+	// used for the upstream proxy connection.
+	UpstreamProxyTLSClientConfig *tls.Config
 }
 
 func hasPort(s string) bool {
@@ -113,7 +119,12 @@ func (proxy *ProxyHttpServer) filterResponse(respOrig *http.Response, ctx *Proxy
 	return
 }
 
-// RemoveProxyHeaders removes all proxy headers which should not propagate to the next hop.
+// RemoveProxyHeaders removes all proxy headers which must not propagate to the
+// next hop. Proxy-Authorization is a hop-by-hop header (RFC 7235): it
+// authenticates this specific connection to the next proxy and must never be
+// forwarded to an origin server or a different hop. Credentials meant for an
+// upstream proxy are injected per hop instead, see NewConnectDialToProxyWithHandler
+// and the upstream URL credentials handled by http.Transport.
 func RemoveProxyHeaders(ctx *ProxyCtx, r *http.Request) {
 	r.RequestURI = "" // this must be reset when serving a request with the client
 	ctx.Logf("Sending request %v %v", r.Method, r.URL.String())
