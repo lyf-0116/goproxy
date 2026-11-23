@@ -155,7 +155,7 @@ func (proxy *ProxyHttpServer) handleH2MitmStream(
 
 	req, resp := proxy.filterRequest(r, ctx)
 	if resp == nil {
-		removeH2HopByHopHeaders(req)
+		removeHTTP2RequestHopByHopHeaders(req.Header)
 		if !proxy.KeepHeader {
 			RemoveProxyHeaders(ctx, req)
 		}
@@ -179,6 +179,11 @@ func (proxy *ProxyHttpServer) handleH2MitmStream(
 	origBody := resp.Body
 	resp = proxy.filterResponse(resp, ctx)
 	defer resp.Body.Close()
+
+	// Strip hop-by-hop response headers for the HTTP/2 hop. The trailer
+	// machinery below relies on resp.Trailer, not the Trailer header, so
+	// trailer forwarding is unaffected.
+	removeHTTP2ResponseHopByHopHeaders(resp.Header)
 
 	copyHeaders(w.Header(), resp.Header, proxy.KeepDestinationHeaders)
 
@@ -261,14 +266,4 @@ func shouldFlushStreaming(resp *http.Response) bool {
 		return true
 	}
 	return resp.ContentLength == -1
-}
-
-// removeH2HopByHopHeaders deletes HTTP/1.x hop-by-hop headers that are
-// illegal in HTTP/2 (RFC 9113 §8.2.2).
-func removeH2HopByHopHeaders(r *http.Request) {
-	r.Header.Del("Connection")
-	r.Header.Del("Keep-Alive")
-	r.Header.Del("Proxy-Connection")
-	r.Header.Del("Transfer-Encoding")
-	r.Header.Del("Upgrade")
 }

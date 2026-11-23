@@ -113,7 +113,12 @@ func (proxy *ProxyHttpServer) filterResponse(respOrig *http.Response, ctx *Proxy
 	return
 }
 
-// RemoveProxyHeaders removes all proxy headers which should not propagate to the next hop.
+// RemoveProxyHeaders removes the hop-by-hop headers of an HTTP/1.x request
+// that must not propagate to the next hop. In addition to the fixed
+// hop-by-hop set (Connection, Proxy-Connection, Keep-Alive, Proxy-*, Te,
+// Trailer, Transfer-Encoding, Upgrade), every field named by the Connection
+// header is parsed and removed per RFC 7230 §6.1. The Connection/Upgrade
+// pair of an upgrade handshake (e.g. WebSocket) is retained.
 func RemoveProxyHeaders(ctx *ProxyCtx, r *http.Request) {
 	r.RequestURI = "" // this must be reset when serving a request with the client
 	ctx.Logf("Sending request %v %v", r.Method, r.URL.String())
@@ -122,25 +127,11 @@ func RemoveProxyHeaders(ctx *ProxyCtx, r *http.Request) {
 		// and would wrap the response body with the relevant reader.
 		r.Header.Del("Accept-Encoding")
 	}
-	// curl can add that, see
-	// https://jdebp.eu./FGA/web-proxy-connection-header.html
-	r.Header.Del("Proxy-Connection")
-	r.Header.Del("Proxy-Authenticate")
-	r.Header.Del("Proxy-Authorization")
-	// Connection, Authenticate and Authorization are single hop Header:
-	// http://www.w3.org/Protocols/rfc2616/rfc2616.txt
-	// 14.10 Connection
-	//   The Connection general-header field allows the sender to specify
-	//   options that are desired for that particular connection and MUST NOT
-	//   be communicated by proxies over further connections.
-
-	// We need to keep "Connection: upgrade" header, since it's part of
-	// the WebSocket handshake, and it won't work without it.
-	// For all the other cases (close, keep-alive), we already handle them, by
-	// setting the r.Close variable in the previous lines.
-	if !isWebSocketHandshake(r.Header) {
-		r.Header.Del("Connection")
-	}
+	// Strip the hop-by-hop headers for this direction/protocol. This also
+	// parses the Connection header and removes every field it names
+	// (RFC 7230 §6.1), not just a fixed list. The Connection/Upgrade pair of
+	// an upgrade handshake (e.g. WebSocket) is retained inside the helper.
+	removeHTTP1RequestHopByHopHeaders(r.Header)
 }
 
 type flushWriter struct {

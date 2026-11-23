@@ -61,6 +61,10 @@ func (proxy *ProxyHttpServer) handleHttp(w http.ResponseWriter, r *http.Request)
 	if origBody != resp.Body {
 		resp.Header.Del("Content-Length")
 	}
+	// Strip hop-by-hop response headers. Transfer-Encoding and Trailer stay
+	// so chunked bodies and trailing fields keep working; an upgrade response
+	// keeps Connection/Upgrade for the handshake.
+	removeHTTP1ResponseHopByHopHeaders(resp.Header)
 	copyHeaders(w.Header(), resp.Header, proxy.KeepDestinationHeaders)
 
 	// Announce trailers known at this point (HTTP/1.1 with pre-announced

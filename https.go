@@ -692,6 +692,14 @@ func (proxy *ProxyHttpServer) handleHttps(w http.ResponseWriter, r *http.Request
 						resp.Close = true
 					}
 
+					// The response is written straight onto the raw hijacked
+					// connection via resp.Write, with no net/http server in
+					// between to drop hop-by-hop headers, so strip them here.
+					// Transfer-Encoding and Trailer are intentionally kept by
+					// the helper for framing/trailer passthrough, and an
+					// upgrade response keeps its Connection/Upgrade headers.
+					removeHTTP1ResponseHopByHopHeaders(resp.Header)
+
 					resp.Body = &onceCloseBody{ReadCloser: resp.Body}
 					defer resp.Body.Close()
 					writer := &responseHeadWriter{writer: client}
