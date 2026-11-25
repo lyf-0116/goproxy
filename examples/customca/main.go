@@ -1,7 +1,6 @@
 package main
 
 import (
-	"crypto/tls"
 	"flag"
 	"log"
 	"net/http"
@@ -12,9 +11,11 @@ import (
 func main() {
 	verbose := flag.Bool("v", false, "should every proxy request be logged to stdout")
 	addr := flag.String("addr", ":8080", "proxy listen address")
+	certFile := flag.String("ca-cert", "ca.pem", "PEM file containing the CA certificate")
+	keyFile := flag.String("ca-key", "key.pem", "PEM file containing the CA private key")
 	flag.Parse()
 
-	cert, err := parseCA(_caCert, _caKey)
+	cert, err := goproxy.LoadOrCreateCA(*certFile, *keyFile)
 	if err != nil {
 		log.Fatal(err)
 	}
@@ -28,12 +29,4 @@ func main() {
 	proxy.OnRequest().HandleConnect(customAlwaysMitm)
 	proxy.Verbose = *verbose
 	log.Fatal(http.ListenAndServe(*addr, proxy))
-}
-
-func parseCA(caCert, caKey []byte) (*tls.Certificate, error) {
-	parsedCert, err := tls.X509KeyPair(caCert, caKey)
-	if err != nil {
-		return nil, err
-	}
-	return &parsedCert, nil
 }

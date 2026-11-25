@@ -31,7 +31,8 @@ type ProxyHttpServer struct {
 	respHandlers    []RespHandler
 	httpsHandlers   []HttpsHandler
 	// Tr is the http.Transport used to send requests to destination servers.
-	// Defaults to a transport that skips TLS verification and reads proxy settings from environment variables.
+	// Defaults to a transport that verifies TLS certificates with system roots
+	// and reads proxy settings from environment variables.
 	Tr *http.Transport
 	// ConnectionErrHandler will be invoked to return a custom response
 	// to clients (written using conn parameter), when goproxy fails to connect
@@ -173,7 +174,7 @@ func NewProxyHttpServer() *ProxyHttpServer {
 		NonproxyHandler: http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
 			http.Error(w, "This is a proxy server. Does not respond to non-proxy requests.", http.StatusInternalServerError)
 		}),
-		Tr:       &http.Transport{TLSClientConfig: tlsClientSkipVerify, Proxy: http.ProxyFromEnvironment},
+		Tr:       &http.Transport{TLSClientConfig: tlsClientSkipVerify.Clone(), Proxy: http.ProxyFromEnvironment},
 		h2Server: &http2.Server{},
 	}
 	proxy.ConnectDial = dialerFromEnv(&proxy)

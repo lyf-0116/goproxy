@@ -158,11 +158,11 @@ const (
 
 var (
 	// OkConnect is a ready-to-use ConnectAction that accepts the CONNECT request
-	// and creates a transparent TCP tunnel to the destination host, using the built-in CA.
+	// and creates a transparent TCP tunnel to the destination host.
 	OkConnect = &ConnectAction{Action: ConnectAccept, TLSConfig: TLSConfigFromCA(&GoproxyCa)}
 
 	// MitmConnect is a ready-to-use ConnectAction that performs MITM interception,
-	// signing dynamic TLS certificates with the built-in CA (GoproxyCa).
+	// signing dynamic TLS certificates with the deployment-specific GoproxyCa.
 	// Use proxy.CertStore to cache generated certificates and save CPU in production.
 	MitmConnect = &ConnectAction{Action: ConnectMitm, TLSConfig: TLSConfigFromCA(&GoproxyCa)}
 

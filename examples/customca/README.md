@@ -18,14 +18,33 @@ The CA certificate must be trusted by your system, or the client will reject
 the connection, since it's not recognized.
 
 ## Trust CA certificate
-The default CA certificate used by GoProxy is in the root folder of this
-project (in files `ca.pem`, and its private key `key.pem`).
+GoProxy does not ship a shared CA private key. Package initialization loads a
+persistent CA from `goproxy.LoadOrCreateDefaultCA()` when its default
+user-configuration directory is writable, and otherwise generates an ephemeral
+CA for the current process.
+
+Export `goproxy.CA_CERT` to a local `ca.pem` file and trust that file. For a
+server deployment, generate and retain an independent CA in a protected
+directory:
+
+```go
+ca, err := goproxy.LoadOrCreateCA("/etc/goproxy/ca.pem", "/etc/goproxy/key.pem")
+if err != nil {
+    log.Fatal(err)
+}
+mitm := &goproxy.ConnectAction{
+    Action:    goproxy.ConnectMitm,
+    TLSConfig: goproxy.TLSConfigFromCA(ca),
+}
+```
+
+The private key is written with mode `0600`; back it up and protect it like
+any other root CA key. Do not trust the historical `ca.pem` from older GoProxy
+source trees, because its matching private key was published in the source.
 
 ### Use your certificate
-You can trust the default certificate or use your own with GoProxy, and
-trust it instead of the provided `ca.pem`.
-If you want to do this, just replace the occurrences of this file in the next
-paragraphs with your CA certificate filename.
+You can also use an existing CA and trust its certificate instead. Replace
+`ca.pem` in the following instructions with your CA certificate filename.
 You can generate your own self-signed certificate with
 [openssl](https://stackoverflow.com/questions/10175812/how-to-generate-a-self-signed-ssl-certificate-using-openssl).
 

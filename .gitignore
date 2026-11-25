@@ -1,2 +1,4 @@
 bin
 *.swp
+ca.pem
+key.pem
